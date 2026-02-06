@@ -6,7 +6,6 @@ import stat
 import errno
 import sys
 import re
-import gdown
 from typing import List, Dict, Optional, Set
 from git import Repo
 from openai import AsyncOpenAI
@@ -24,8 +23,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not OPENAI_API_KEY:
-    print("⚠️ OPENAI_API_KEY not found in .env. Please set it or enter it below.")
-    # OPENAI_API_KEY = "sk-..." 
+    print("⚠️ OPENAI_API_KEY not found in .env. Please set it.")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -129,8 +127,10 @@ async def async_read_file(path, relative_path):
     
     return content
 
-# --- Source Handlers ---
+# --- Source Handler: GitHub Only ---
+
 async def handle_github_repo(url, source_id):
+    if not url: return None
     repo_path = os.path.join(TEMP_DIR, f"repo_{source_id}")
     print(f"🔄 Cloning GitHub Repo: {url}...")
     try:
@@ -140,63 +140,43 @@ async def handle_github_repo(url, source_id):
         print(f"❌ Git Clone Failed: {e}")
         return None
 
-async def handle_google_drive(url, source_id):
-    output_path = os.path.join(TEMP_DIR, f"gdrive_{source_id}")
-    os.makedirs(output_path, exist_ok=True)
-    file_id_match = re.search(r'/d/([a-zA-Z0-9-_]+)', url)
-    file_id = file_id_match.group(1) if file_id_match else None
-    
-    if not file_id: return None
-
-    final_url = url
-    is_native_doc = False
-    
-    if "/document/d/" in url:
-        final_url = f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
-        is_native_doc = True
-    elif "/presentation/d/" in url:
-        final_url = f"https://docs.google.com/presentation/d/{file_id}/export/pdf"
-        is_native_doc = True
-    elif "/spreadsheets/d/" in url:
-        final_url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=pdf"
-        is_native_doc = True
-
-    try:
-        output_file = os.path.join(output_path, f"doc_{source_id}.pdf" if is_native_doc else f"file_{source_id}")
-        await asyncio.to_thread(gdown.download, final_url, output_file, quiet=True, fuzzy=True)
-        return output_path
-    except Exception as e:
-        print(f"❌ Drive Download Error: {e}")
-        return None
-
-async def ingest_sources(source_inputs: List[str]):
+# --- Ingestion Orchestrator ---
+async def ingest_sources(github_inputs: str):
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR, onerror=handle_remove_readonly)
     os.makedirs(TEMP_DIR, exist_ok=True)
-    tasks, paths = [], []
     
-    for i, source in enumerate(source_inputs):
-        source = source.strip()
-        local_dir = None
-        if "github.com" in source: local_dir = await handle_github_repo(source, i)
-        elif "drive.google.com" in source or "docs.google.com" in source: local_dir = await handle_google_drive(source, i)
-        else: continue
-            
-        if local_dir:
-            for root, _, files in os.walk(local_dir):
-                if ".git" in root: continue
-                for file in files:
-                    full_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(full_path, TEMP_DIR)
-                    if is_valid_file(file):
-                        tasks.append(async_read_file(full_path, rel_path))
-                        paths.append(rel_path)
+    tasks = []
+    paths = []
+    
+    git_urls = [s.strip() for s in github_inputs.split(',') if s.strip()]
+    
+    # Collect Directories
+    dir_tasks = []
+    for i, url in enumerate(git_urls):
+        dir_tasks.append(handle_github_repo(url, i))
+        
+    local_dirs = await asyncio.gather(*dir_tasks)
+    
+    # Walk Directories
+    for local_dir in local_dirs:
+        if not local_dir: continue
+        for root, _, files in os.walk(local_dir):
+            if ".git" in root: continue
+            for file in files:
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, TEMP_DIR)
+                if is_valid_file(file):
+                    tasks.append(async_read_file(full_path, rel_path))
+                    paths.append(rel_path)
 
-    print(f"\n📖 Processing {len(tasks)} gathered files...")
+    print(f"\n📖 Processing gathered files...")
     results = await asyncio.gather(*tasks)
+    
     files_data = {}
     for p, c in zip(paths, results):
         if c and c.strip(): files_data[p] = {"content": c}
-    print(f"\n✅ Total Loaded: {len(files_data)} valid files.")
+
+    print(f"\n✅ Total Loaded: {len(files_data)} items.")
     return files_data
 
 # --- 2. Strict Graph Summarizer ---
@@ -281,6 +261,8 @@ async def reframer_agent(user_query, chat_history):
 async def smart_filter_dependencies(query, parent_file, potential_deps, all_files):
     if not potential_deps: return []
     real_candidates = []
+    
+    # Fuzzy match dependencies to file list
     for dep in potential_deps:
         matches = [f for f in all_files if dep in f or f.endswith(dep)]
         if matches: real_candidates.append(min(matches, key=len)) 
@@ -376,12 +358,19 @@ async def answering_agent(user_query, selected_files, files_data):
 async def main():
     chat_history = []
     try:
-        print("🔗 Enter sources (comma-separated):")
-        raw_input = input("> ")
-        if not raw_input: return
-        sources = [s.strip() for s in raw_input.split(',')]
-        files_data = await ingest_sources(sources)
-        if not files_data: return
+        print("🔗 === SOURCE CONFIGURATION === 🔗")
+        
+        gh_input = input("\n🐙 Enter GitHub Repos (comma-separated): ")
+        
+        if not gh_input.strip():
+            print("❌ No sources provided. Exiting.")
+            return
+
+        files_data = await ingest_sources(gh_input)
+        
+        if not files_data: 
+            print("❌ No valid data loaded.")
+            return
 
         # 1. Summarize
         knowledge_base = await summarizer_agent(files_data)
@@ -396,7 +385,7 @@ async def main():
             # 3. Select (Seed + Pruned Graph)
             selected_files = await selector_agent(technical_query, knowledge_base, files_data)
             
-            # 4. Answer (No Evaluator Loop)
+            # 4. Answer
             answer, context = await answering_agent(query, selected_files, files_data)
             
             print("\n" + "="*60 + f"\n✅ ANSWER:\n{answer}\n" + "="*60)
