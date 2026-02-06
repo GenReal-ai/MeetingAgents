@@ -6,7 +6,9 @@ import stat
 import errno
 import sys
 import re
-from typing import List, Dict, Optional, Set, Union
+import ast
+import hashlib
+from typing import List, Dict, Optional, Set, Any
 from git import Repo
 from openai import AsyncOpenAI
 from pypdf import PdfReader
@@ -24,9 +26,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = "gpt-4o-mini"
 
 # Graph Configuration
-MAX_RECURSION_DEPTH = 5   # Trace dependencies 5 levels deep
+MAX_RECURSION_DEPTH = 3   # We can go deeper now because nodes are smaller
 MAX_CONCURRENCY = 50 
 MAX_CONTEXT_CHARS = 200000 
+
+# Cache Configuration
+CACHE_FILE = "symbol_graph_cache.json"
 
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY not found in .env. Please set it.")
@@ -35,8 +40,7 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # Paths
 TEMP_DIR = "./temp_session_data"
-SUMMARIES_DIR = "./repo_summaries"
-KNOWLEDGE_BASE_FILE = "session_knowledge.json"
+KNOWLEDGE_BASE_FILE = "symbol_graph.json"
 
 # --- Helper: Force Delete Read-Only Files ---
 def handle_remove_readonly(func, path, exc):
@@ -72,9 +76,6 @@ def perform_cleanup():
     if os.path.exists(TEMP_DIR):
         try: shutil.rmtree(TEMP_DIR, onerror=handle_remove_readonly)
         except: pass
-    if os.path.exists(SUMMARIES_DIR):
-        try: shutil.rmtree(SUMMARIES_DIR, onerror=handle_remove_readonly)
-        except: pass
     if os.path.exists(KNOWLEDGE_BASE_FILE):
         try: os.remove(KNOWLEDGE_BASE_FILE)
         except: pass
@@ -88,12 +89,9 @@ def is_valid_file(filename):
         'requirements.txt', 'package.json', 'cargo.toml', 'go.mod', 'pom.xml'
     }
     ALLOWED_EXTENSIONS = {
-        '.md', '.markdown', '.txt', '.pdf', '.docx', '.rst',
-        '.py', '.ipynb', '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte', 
-        '.html', '.css', '.scss', '.java', '.kt', '.scala', '.c', '.cpp', 
-        '.h', '.hpp', '.cs', '.go', '.rs', '.rb', '.php', '.sh', '.bat', 
-        '.ps1', '.swift', '.sql', '.json', '.yaml', '.yml', '.xml', '.toml'
+        '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.h', '.cs', '.go', '.rs', '.rb', '.php'
     }
+    # For Function Graph, we prioritize code files.
     name = os.path.basename(filename).lower()
     ext = os.path.splitext(filename)[1].lower()
     return name in ALWAYS_KEEP_NAMES or ext in ALLOWED_EXTENSIONS
@@ -103,34 +101,9 @@ def read_universal_text(path):
         with open(path, 'r', encoding='utf-8', errors='replace') as f: return f.read()
     except: return ""
 
-def read_docx(path):
-    if not HAS_DOCX: return "[MISSING DEPENDENCY] Install 'python-docx'"
-    try:
-        doc = Document(path)
-        return "\n".join([para.text for para in doc.paragraphs])
-    except: return ""
-
 async def async_read_file(path, relative_path):
-    print(f"   📄 Reading: {relative_path}...", end="\r") 
-    ext = os.path.splitext(path)[1].lower()
-    content = ""
-    
-    if ext == '.pdf': 
-        try: content = "\n".join([p.extract_text() or "" for p in PdfReader(path).pages])
-        except: content = ""
-    elif ext == '.docx':
-        content = await asyncio.to_thread(read_docx, path)
-    elif ext == '.ipynb':
-        try:
-            with open(path, 'r', encoding='utf-8') as f: notebook = json.load(f)
-            content = "\n".join(["".join(c['source']) for c in notebook.get('cells', []) if c['cell_type'] in ['code', 'markdown']])
-        except: content = ""
-    else: 
-        content = await asyncio.to_thread(read_universal_text, path)
-    
-    return content
-
-# --- Source Handler: GitHub Only ---
+    # We strictly only care about text/code for AST parsing
+    return await asyncio.to_thread(read_universal_text, path)
 
 async def handle_github_repo(url, source_id):
     if not url: return None
@@ -174,74 +147,158 @@ async def ingest_sources(github_inputs: str):
     
     files_data = {}
     for p, c in zip(paths, results):
-        if c and c.strip(): files_data[p] = {"content": c}
+        if c and c.strip(): 
+            files_data[p] = {"content": c}
 
     print(f"\n✅ Total Loaded: {len(files_data)} items.")
     return files_data
 
-# --- 2. Symbol Graph Summarizer (Advanced) ---
+# --- 2. AST Symbol Parser (The Engine) ---
 
-async def generate_symbol_graph(sem, filename, content, counter, total):
-    async with sem:
-        # We ask for "Exports" (what is defined) and "Dependencies" (what is used)
-        prompt = f"""
-        Analyze this code file for a Granular Dependency Graph.
-        File: {filename}
-        
-        TASK:
-        1. List 'exports': Major Classes and Functions defined in this file.
-        2. List 'dependencies': External files AND the specific symbols (classes/funcs) used from them.
-        
-        Content Snippet (First 15k chars):
-        {content[:15000]}
-        
-        Return JSON: {{ 
-            "purpose": "Brief summary",
-            "exports": ["class UserManager", "def validate_email"],
-            "dependencies": [
-                {{ "filename": "database.py", "symbols_used": ["class DBConnection", "def connect"] }}
-            ]
-        }}
-        """
-        try:
-            res = await safe_chat_completion(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}
-            )
-            data = json.loads(res.choices[0].message.content)
-            
-            if "exports" not in data: data["exports"] = []
-            if "dependencies" not in data: data["dependencies"] = []
-            
-            counter[0] += 1
-            print(f"   [ {counter[0]}/{total} ] Mapped Symbols: {os.path.basename(filename)}")
-            return data
-        except Exception as e:
-            counter[0] += 1
-            return {"purpose": "Error", "exports": [], "dependencies": []}
+class PythonFunctionVisitor(ast.NodeVisitor):
+    def __init__(self, content):
+        self.content = content
+        self.nodes = [] # List of dicts: {name, type, code, calls}
+        self.global_context = [] # Imports and global assignments
+        self.current_scope = None
 
-async def summarizer_agent(files_data):
-    print("\n🕵️  Summarizer Agent: Building Symbol Graph...")
-    if os.path.exists(SUMMARIES_DIR): shutil.rmtree(SUMMARIES_DIR, onerror=handle_remove_readonly)
-    os.makedirs(SUMMARIES_DIR)
+    def get_code(self, node):
+        return ast.get_source_segment(self.content, node)
 
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    counter, total = [0], len(files_data)
+    def visit_Import(self, node):
+        self.global_context.append(self.get_code(node))
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        self.global_context.append(self.get_code(node))
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self._handle_func_or_class(node, "function")
+
+    def visit_AsyncFunctionDef(self, node):
+        self._handle_func_or_class(node, "function")
+
+    def visit_ClassDef(self, node):
+        self._handle_func_or_class(node, "class")
+
+    def _handle_func_or_class(self, node, node_type):
+        # We only track top-level or class-level (not nested funcs for now to keep graph clean)
+        # unless user wants extreme detail. Let's stick to top-level/class-level.
+        
+        name = node.name
+        code = self.get_code(node)
+        
+        # Extract calls made INSIDE this node
+        call_visitor = CallExtractor()
+        call_visitor.visit(node)
+        
+        self.nodes.append({
+            "name": name,
+            "type": node_type,
+            "code": code,
+            "calls": list(call_visitor.calls)
+        })
+
+class CallExtractor(ast.NodeVisitor):
+    def __init__(self):
+        self.calls = set()
+
+    def visit_Call(self, node):
+        # Extract function name from calls like func() or module.func()
+        if isinstance(node.func, ast.Name):
+            self.calls.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            self.calls.add(node.func.attr)
+        self.generic_visit(node)
+
+def parse_python_symbols(filename, content):
+    try:
+        tree = ast.parse(content)
+        visitor = PythonFunctionVisitor(content)
+        visitor.visit(tree)
+        return {
+            "nodes": visitor.nodes,
+            "globals": "\n".join(visitor.global_context)
+        }
+    except Exception as e:
+        # print(f"AST Error in {filename}: {e}")
+        return {"nodes": [], "globals": ""}
+
+async def build_symbol_graph(files_data):
+    print("\n🕵️  Graph Builder: Parsing Symbols & Linking Nodes...")
     
-    tasks = [generate_symbol_graph(sem, f, d['content'], counter, total) for f, d in files_data.items()]
-    results = await asyncio.gather(*tasks)
+    # 1. Parse all files to find Definitions (Nodes)
+    # Registry: { "function_name": [ {file, code, calls} ] }
+    # List because multiple files might have 'main' or 'utils'
+    symbol_registry = {} 
+    file_globals = {} # filename -> string of imports/globals
 
-    knowledge_base = {}
-    for filename, result in zip(files_data.keys(), results):
-        knowledge_base[filename] = result
+    for filename, data in files_data.items():
+        if filename.endswith(".py"):
+            result = parse_python_symbols(filename, data['content'])
+            file_globals[filename] = result['globals']
+            
+            for node in result['nodes']:
+                name = node['name']
+                if name not in symbol_registry:
+                    symbol_registry[name] = []
+                
+                symbol_registry[name].append({
+                    "file": filename,
+                    "type": node['type'],
+                    "code": node['code'],
+                    "calls": node['calls'] # These are candidate calls
+                })
+        else:
+            # Non-python files: Treat whole file as one node for now (Fallback)
+            # Or use LLM to extract symbols if needed. 
+            pass
 
-    with open(KNOWLEDGE_BASE_FILE, 'w') as f: json.dump(knowledge_base, f, indent=2)
-    return knowledge_base
+    # 2. Link Edges (Resolve Calls)
+    # We only link if the called function exists in our Registry (Internal Dependency)
+    # This automatically filters out numpy, pandas, etc.
+    
+    graph = {} # "filename::symbolname" -> { metadata, dependencies: [] }
+    
+    defined_symbols = set(symbol_registry.keys())
+
+    for sym_name, implementations in symbol_registry.items():
+        for impl in implementations:
+            # Create a unique ID for the node
+            node_id = f"{impl['file']}::{sym_name}"
+            
+            # Filter calls: Only keep calls that exist in our repo
+            valid_deps = []
+            for called_func in impl['calls']:
+                if called_func in defined_symbols:
+                    # Logic to resolve WHICH file it comes from.
+                    # Simple heuristic: If multiple files have 'util_func', we link to all (ambiguous) 
+                    # or prefer same directory. For now, link all matches.
+                    targets = symbol_registry[called_func]
+                    for target in targets:
+                        target_id = f"{target['file']}::{called_func}"
+                        # Don't self-reference
+                        if target_id != node_id:
+                            valid_deps.append(target_id)
+            
+            graph[node_id] = {
+                "file": impl['file'],
+                "code": impl['code'],
+                "type": impl['type'],
+                "globals": file_globals.get(impl['file'], ""),
+                "dependencies": list(set(valid_deps)) # Dedup
+            }
+
+    print(f"   ✅ Graph Built: {len(graph)} function/class nodes created.")
+    
+    # Save for debugging
+    with open(KNOWLEDGE_BASE_FILE, 'w') as f: json.dump(graph, f, indent=2)
+    return graph
 
 # --- 3. Reframer Agent ---
 async def reframer_agent(user_query, chat_history):
-    print("🧠 Reframer: Clarifying intent using history...", flush=True)
+    print("🧠 Reframer: Clarifying intent...", flush=True)
     history_text = ""
     for turn in chat_history[-3:]: history_text += f"{turn['role'].upper()}: {turn['content']}\n"
 
@@ -253,53 +310,36 @@ async def reframer_agent(user_query, chat_history):
     """
     res = await safe_chat_completion(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}])
     new_query = res.choices[0].message.content.strip()
-    print(f"   ↳ Resolved Query: \"{new_query}\"")
+    print(f"   ↳ Resolved: \"{new_query}\"")
     return new_query
 
-# --- 4. Deep Graph Selector & Slicer ---
+# --- 4. Symbol Graph Selector ---
 
-async def extract_relevant_code(filename, full_content, symbols_needed):
-    """
-    Uses LLM to slice the file and return ONLY the requested functions/classes.
-    """
-    if not symbols_needed:
-        # If explicitly no symbols, maybe just return headers.
-        return f"--- Snippet from {filename} (Headers Only) ---\n{full_content[:1000]}\n...(truncated)...\n"
+async def selector_agent(technical_query, graph):
+    print(f"🗂️  Selector: Picking Function Nodes...", flush=True)
+    
+    # 1. Create a "Menu" for the LLM
+    # We can't dump code. Just signatures.
+    menu = []
+    for node_id, data in graph.items():
+        menu.append(f"ID: {node_id} | Type: {data['type']}")
+    
+    # If menu is too huge, we might need embeddings. 
+    # For now, let's assume < 500 functions or truncate.
+    menu_str = "\n".join(menu[:800]) # Hard limit for safety
 
     prompt = f"""
-    You are a Code Slicer. 
-    File: {filename}
-    Target Symbols: {json.dumps(list(symbols_needed))}
+    You are a Code Navigator.
+    Query: "{technical_query}"
+    
+    Available Functions/Classes (Nodes):
+    {menu_str}
     
     TASK:
-    Return ONLY the code blocks (function definitions, class definitions) for the Target Symbols.
-    Include necessary imports at the top.
-    DO NOT summarize. Return actual code.
+    Select 2-4 STARTING NODES (IDs) that are most likely to handle the logic for the query.
+    Do not pick utility functions unless core to the query.
     
-    Code Context:
-    {full_content[:40000]} 
-    """
-    
-    try:
-        res = await safe_chat_completion(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return f"--- Snippet from {filename} (Filtered for: {', '.join(symbols_needed)}) ---\n{res.choices[0].message.content}\n"
-    except:
-        return f"--- {filename} ---\n{full_content[:5000]}\n" 
-
-async def selector_agent(technical_query, knowledge_base, files_data):
-    print(f"🗂️  Selector: Tracing Recursive Dependency Chain (Depth {MAX_RECURSION_DEPTH})...", flush=True)
-    
-    # 1. Identify Seeds
-    index_view = {k: {"purpose": v.get('purpose'), "exports": v.get('exports')} for k, v in knowledge_base.items()}
-    
-    prompt = f"""
-    Identify 2-3 Seed Files for: "{technical_query}"
-    Look at 'exports' to find the code owners.
-    Index: {json.dumps(index_view)}
-    Return JSON: {{ "seed_files": ["main.py", "logic.py"] }}
+    Return JSON: {{ "seed_nodes": ["file.py::func_name"] }}
     """
     
     res = await safe_chat_completion(
@@ -307,95 +347,72 @@ async def selector_agent(technical_query, knowledge_base, files_data):
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
-    seed_files = json.loads(res.choices[0].message.content).get('seed_files', [])
-    print(f"   🌱 Seeds: {seed_files}")
-
-    # "requirements" maps: Real Filename -> Set of Symbols Needed
-    # If Set is "ALL", we load the full file (only for seeds).
-    requirements: Dict[str, Union[str, Set[str]]] = {} 
     
-    # Queue for BFS: List of Real Filenames
+    seed_nodes = json.loads(res.choices[0].message.content).get('seed_nodes', [])
+    print(f"   🌱 Seeds: {seed_nodes}")
+
+    # 2. Graph Traversal (DFS/BFS)
+    selected_nodes = set()
     queue = []
+    
+    # Validate seeds
+    for seed in seed_nodes:
+        if seed in graph:
+            queue.append(seed)
+            selected_nodes.add(seed)
 
-    # Initialize Seeds
-    for seed in seed_files:
-        real_seed = next((f for f in files_data.keys() if seed in f), None)
-        if real_seed:
-            requirements[real_seed] = "ALL"  # Seeds are loaded fully (change to set() if you want seeds sliced too)
-            queue.append(real_seed)
-
-    # 2. BFS Traversal (Up to Depth 5)
     current_depth = 0
     while queue and current_depth < MAX_RECURSION_DEPTH:
-        # print(f"      📍 Depth {current_depth}: Processing {len(queue)} files...")
         next_queue = []
+        for current_node_id in queue:
+            node = graph[current_node_id]
+            deps = node['dependencies']
+            
+            for dep_id in deps:
+                if dep_id not in selected_nodes:
+                    selected_nodes.add(dep_id)
+                    next_queue.append(dep_id)
         
-        for current_file in queue:
-            if current_file not in knowledge_base: continue
-            
-            # Get dependencies of current file
-            deps = knowledge_base[current_file].get("dependencies", [])
-            
-            for dep in deps:
-                dep_name_ref = dep.get("filename")
-                symbols_needed = set(dep.get("symbols_used", []))
-                
-                # Find valid file
-                real_dep_file = next((f for f in files_data.keys() if dep_name_ref in f), None)
-                if not real_dep_file: continue
-                
-                # If we haven't seen this file, add it
-                if real_dep_file not in requirements:
-                    requirements[real_dep_file] = symbols_needed
-                    next_queue.append(real_dep_file)
-                else:
-                    # If we have seen it, MERGE symbols (unless it's already ALL)
-                    if requirements[real_dep_file] != "ALL":
-                        requirements[real_dep_file].update(symbols_needed)
-
         queue = next_queue
         current_depth += 1
 
-    # 3. Generate Context (Slicing)
-    final_context = []
-    current_chars = 0
+    # 3. Construct Context
+    # We group by FILE to avoid repeating imports/globals
     
-    # Sort files to put seeds first
-    sorted_files = sorted(requirements.keys(), key=lambda k: 0 if requirements[k] == "ALL" else 1)
-
-    print(f"      ✂️  Slicing {len(sorted_files)} files for context...")
+    files_context = {} # filename -> list of function codes
     
-    for fname in sorted_files:
-        if current_chars > MAX_CONTEXT_CHARS:
-            print(f"   ⚠️ Context limit reached. Stopping at {fname}")
-            break
-            
-        reqs = requirements[fname]
-        content = files_data[fname]['content']
+    for node_id in selected_nodes:
+        node = graph[node_id]
+        fname = node['file']
         
-        if reqs == "ALL":
-            # Full Content (Seed)
-            chunk = f"=== FOCUS FILE: {fname} ===\n{content}\n"
-        else:
-            # Sliced Content (Dependency)
-            symbol_list = list(reqs)
-            chunk = await extract_relevant_code(fname, content, symbol_list)
-            
-        final_context.append(chunk)
-        current_chars += len(chunk)
+        if fname not in files_context:
+            files_context[fname] = {
+                "globals": node['globals'],
+                "functions": []
+            }
+        
+        files_context[fname]["functions"].append(node['code'])
 
-    return final_context
+    # Final Text Construction
+    final_output = []
+    for fname, data in files_context.items():
+        block = f"=== FILE: {fname} ===\n"
+        block += f"{data['globals']}\n" # Imports
+        block += "\n# ... (unrelated code hidden) ...\n\n"
+        block += "\n\n".join(data['functions'])
+        final_output.append(block)
+
+    print(f"   🕸️  Selected {len(selected_nodes)} functions across {len(files_context)} files.")
+    return final_output
 
 # --- 5. Answering Agent ---
 async def answering_agent(user_query, context_strings):
     print("📝 Answering Agent: Generating response...", flush=True)
-    
     full_context = "\n".join(context_strings)
-    
     res = await safe_chat_completion(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "You are a senior developer. Answer based strictly on the provided Code Context. Cite which file logic comes from."},
+            {"role": "system", "content": "You are a senior developer. Answer based strictly on the provided Code Context."},
             {"role": "user", "content": f"Query: {user_query}\n\nCode Context:\n{full_context}"}
         ]
     )
@@ -406,21 +423,14 @@ async def main():
     chat_history = []
     try:
         print("🔗 === GITHUB SOURCE CONFIGURATION === 🔗")
-        
         gh_input = input("\n🐙 Enter GitHub Repos (comma-separated): ")
-        
-        if not gh_input.strip():
-            print("❌ No sources provided. Exiting.")
-            return
+        if not gh_input.strip(): return
 
         files_data = await ingest_sources(gh_input)
-        
-        if not files_data: 
-            print("❌ No valid data loaded.")
-            return
+        if not files_data: return
 
-        # 1. Summarize (Symbol Level)
-        knowledge_base = await summarizer_agent(files_data)
+        # 1. Build Function Graph (AST)
+        graph = await build_symbol_graph(files_data)
         
         while True:
             query = input("\n" + "-"*40 + "\n(Type 'exit' to quit) Question: ")
@@ -429,8 +439,8 @@ async def main():
             # 2. Reframe
             technical_query = await reframer_agent(query, chat_history)
             
-            # 3. Select & Slice (Recursive Depth 5)
-            context_strings = await selector_agent(technical_query, knowledge_base, files_data)
+            # 3. Select (Function Graph Traversal)
+            context_strings = await selector_agent(technical_query, graph)
             
             if not context_strings:
                 print("   ⚠️ No relevant code found.")
@@ -438,10 +448,8 @@ async def main():
 
             # 4. Answer
             answer = await answering_agent(query, context_strings)
-            
             print("\n" + "="*60 + f"\n✅ ANSWER:\n{answer}\n" + "="*60)
             
-            # 5. Update History
             chat_history.append({"role": "user", "content": query})
             chat_history.append({"role": "assistant", "content": answer})
 
