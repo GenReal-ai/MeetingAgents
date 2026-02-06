@@ -26,7 +26,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = "gpt-4o-mini"
 
 # Graph Configuration
-MAX_RECURSION_DEPTH = 3   # We can go deeper now because nodes are smaller
+MAX_RECURSION_DEPTH = 3
 MAX_CONCURRENCY = 50 
 MAX_CONTEXT_CHARS = 200000 
 
@@ -91,7 +91,6 @@ def is_valid_file(filename):
     ALLOWED_EXTENSIONS = {
         '.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.h', '.cs', '.go', '.rs', '.rb', '.php'
     }
-    # For Function Graph, we prioritize code files.
     name = os.path.basename(filename).lower()
     ext = os.path.splitext(filename)[1].lower()
     return name in ALWAYS_KEEP_NAMES or ext in ALLOWED_EXTENSIONS
@@ -102,26 +101,32 @@ def read_universal_text(path):
     except: return ""
 
 async def async_read_file(path, relative_path):
-    # We strictly only care about text/code for AST parsing
     return await asyncio.to_thread(read_universal_text, path)
 
 async def handle_github_repo(url, source_id):
-    if not url: return None
-    repo_path = os.path.join(TEMP_DIR, f"repo_{source_id}")
-    print(f"🔄 Cloning GitHub Repo: {url}...")
+    if not url: return None, None
+    
+    # Extract clean repo name for isolation
+    # e.g., https://github.com/user/my-repo.git -> my-repo
+    clean_name = url.split("/")[-1].replace(".git", "")
+    if not clean_name: clean_name = f"repo_{source_id}"
+    
+    # Ensure unique names if user inputs duplicates
+    repo_path = os.path.join(TEMP_DIR, f"{clean_name}_{source_id}")
+    
+    print(f"🔄 Cloning {clean_name}...")
     try:
         await asyncio.to_thread(Repo.clone_from, url, repo_path)
-        return repo_path
+        return repo_path, clean_name
     except Exception as e:
-        print(f"❌ Git Clone Failed: {e}")
-        return None
+        print(f"❌ Git Clone Failed for {url}: {e}")
+        return None, None
 
 async def ingest_sources(github_inputs: str):
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR, onerror=handle_remove_readonly)
     os.makedirs(TEMP_DIR, exist_ok=True)
     
     tasks = []
-    paths = []
     
     git_urls = [s.strip() for s in github_inputs.split(',') if s.strip()]
     
@@ -129,37 +134,53 @@ async def ingest_sources(github_inputs: str):
     for i, url in enumerate(git_urls):
         dir_tasks.append(handle_github_repo(url, i))
         
-    local_dirs = await asyncio.gather(*dir_tasks)
+    # results is list of (path, name) tuples
+    repo_results = await asyncio.gather(*dir_tasks)
     
-    for local_dir in local_dirs:
-        if not local_dir: continue
-        for root, _, files in os.walk(local_dir):
+    # Structure: { "repo_name": { "filepath": { "content": ... } } }
+    multi_repo_data = {}
+    
+    read_tasks = []
+    
+    for repo_path, repo_name in repo_results:
+        if not repo_path: continue
+        
+        if repo_name not in multi_repo_data:
+            multi_repo_data[repo_name] = {}
+            
+        for root, _, files in os.walk(repo_path):
             if ".git" in root: continue
             for file in files:
                 full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, TEMP_DIR)
+                # Keep path relative to the specific repo root
+                rel_path = os.path.relpath(full_path, repo_path)
+                
                 if is_valid_file(file):
-                    tasks.append(async_read_file(full_path, rel_path))
-                    paths.append(rel_path)
+                    # We store a tuple reference to update the dict later
+                    read_tasks.append((async_read_file(full_path, rel_path), repo_name, rel_path))
 
-    print(f"\n📖 Processing gathered files...")
-    results = await asyncio.gather(*tasks)
+    print(f"\n📖 Reading files across {len(multi_repo_data)} repositories...")
     
-    files_data = {}
-    for p, c in zip(paths, results):
-        if c and c.strip(): 
-            files_data[p] = {"content": c}
+    # Execute reads
+    file_contents = await asyncio.gather(*[t[0] for t in read_tasks])
+    
+    total_files = 0
+    for i, content in enumerate(file_contents):
+        _, r_name, r_path = read_tasks[i]
+        if content and content.strip():
+            multi_repo_data[r_name][r_path] = {"content": content}
+            total_files += 1
 
-    print(f"\n✅ Total Loaded: {len(files_data)} items.")
-    return files_data
+    print(f"✅ Total Loaded: {total_files} files across {list(multi_repo_data.keys())}.")
+    return multi_repo_data
 
-# --- 2. AST Symbol Parser (The Engine) ---
+# --- 2. AST Symbol Parser ---
 
 class PythonFunctionVisitor(ast.NodeVisitor):
     def __init__(self, content):
         self.content = content
-        self.nodes = [] # List of dicts: {name, type, code, calls}
-        self.global_context = [] # Imports and global assignments
+        self.nodes = [] 
+        self.global_context = [] 
         self.current_scope = None
 
     def get_code(self, node):
@@ -183,13 +204,8 @@ class PythonFunctionVisitor(ast.NodeVisitor):
         self._handle_func_or_class(node, "class")
 
     def _handle_func_or_class(self, node, node_type):
-        # We only track top-level or class-level (not nested funcs for now to keep graph clean)
-        # unless user wants extreme detail. Let's stick to top-level/class-level.
-        
         name = node.name
         code = self.get_code(node)
-        
-        # Extract calls made INSIDE this node
         call_visitor = CallExtractor()
         call_visitor.visit(node)
         
@@ -205,7 +221,6 @@ class CallExtractor(ast.NodeVisitor):
         self.calls = set()
 
     def visit_Call(self, node):
-        # Extract function name from calls like func() or module.func()
         if isinstance(node.func, ast.Name):
             self.calls.add(node.func.id)
         elif isinstance(node.func, ast.Attribute):
@@ -221,19 +236,15 @@ def parse_python_symbols(filename, content):
             "nodes": visitor.nodes,
             "globals": "\n".join(visitor.global_context)
         }
-    except Exception as e:
-        # print(f"AST Error in {filename}: {e}")
+    except:
         return {"nodes": [], "globals": ""}
 
-async def build_symbol_graph(files_data):
-    print("\n🕵️  Graph Builder: Parsing Symbols & Linking Nodes...")
-    
-    # 1. Parse all files to find Definitions (Nodes)
-    # Registry: { "function_name": [ {file, code, calls} ] }
-    # List because multiple files might have 'main' or 'utils'
+async def build_single_repo_graph(repo_name, files_data):
+    """Builds a graph for a single repository, isolated from others."""
     symbol_registry = {} 
-    file_globals = {} # filename -> string of imports/globals
+    file_globals = {} 
 
+    # 1. Parse Definitions
     for filename, data in files_data.items():
         if filename.endswith(".py"):
             result = parse_python_symbols(filename, data['content'])
@@ -248,37 +259,23 @@ async def build_symbol_graph(files_data):
                     "file": filename,
                     "type": node['type'],
                     "code": node['code'],
-                    "calls": node['calls'] # These are candidate calls
+                    "calls": node['calls']
                 })
-        else:
-            # Non-python files: Treat whole file as one node for now (Fallback)
-            # Or use LLM to extract symbols if needed. 
-            pass
-
-    # 2. Link Edges (Resolve Calls)
-    # We only link if the called function exists in our Registry (Internal Dependency)
-    # This automatically filters out numpy, pandas, etc.
     
-    graph = {} # "filename::symbolname" -> { metadata, dependencies: [] }
-    
+    # 2. Link Edges
+    graph = {} 
     defined_symbols = set(symbol_registry.keys())
 
     for sym_name, implementations in symbol_registry.items():
         for impl in implementations:
-            # Create a unique ID for the node
             node_id = f"{impl['file']}::{sym_name}"
             
-            # Filter calls: Only keep calls that exist in our repo
             valid_deps = []
             for called_func in impl['calls']:
                 if called_func in defined_symbols:
-                    # Logic to resolve WHICH file it comes from.
-                    # Simple heuristic: If multiple files have 'util_func', we link to all (ambiguous) 
-                    # or prefer same directory. For now, link all matches.
                     targets = symbol_registry[called_func]
                     for target in targets:
                         target_id = f"{target['file']}::{called_func}"
-                        # Don't self-reference
                         if target_id != node_id:
                             valid_deps.append(target_id)
             
@@ -287,59 +284,113 @@ async def build_symbol_graph(files_data):
                 "code": impl['code'],
                 "type": impl['type'],
                 "globals": file_globals.get(impl['file'], ""),
-                "dependencies": list(set(valid_deps)) # Dedup
+                "dependencies": list(set(valid_deps))
             }
-
-    print(f"   ✅ Graph Built: {len(graph)} function/class nodes created.")
-    
-    # Save for debugging
-    with open(KNOWLEDGE_BASE_FILE, 'w') as f: json.dump(graph, f, indent=2)
+            
+    print(f"   Built Graph for [{repo_name}]: {len(graph)} nodes")
     return graph
 
-# --- 3. Reframer Agent ---
-async def reframer_agent(user_query, chat_history):
-    print("🧠 Reframer: Clarifying intent...", flush=True)
+async def build_multi_symbol_graph(multi_repo_data):
+    print("\n🕵️  Graph Builder: Building isolated graphs per repo...")
+    
+    multi_graph = {}
+    
+    for repo_name, files_data in multi_repo_data.items():
+        multi_graph[repo_name] = await build_single_repo_graph(repo_name, files_data)
+        
+    with open(KNOWLEDGE_BASE_FILE, 'w') as f: json.dump(multi_graph, f, indent=2)
+    return multi_graph
+
+# --- 3. Context-Aware Reframer ---
+
+async def reframer_agent(user_query, chat_history, available_repos):
+    print("🧠 Reframer: Detecting Target Repo...", flush=True)
     history_text = ""
     for turn in chat_history[-3:]: history_text += f"{turn['role'].upper()}: {turn['content']}\n"
 
+    repo_list_str = ", ".join(available_repos)
+
     prompt = f"""
-    Rewrite the user's query into a precise technical search query.
-    History: {history_text}
-    Query: "{user_query}"
-    Return ONLY the rewritten query.
+    You are a Technical Assistant managing multiple repositories.
+    Available Repositories: [{repo_list_str}]
+    
+    Conversation History:
+    {history_text}
+    
+    Current Query: "{user_query}"
+    
+    TASK:
+    1. Determine which Repository the user is referring to. 
+       - If they mention a specific repo name, use that.
+       - If context implies one (e.g., following up on previous questions), use that.
+       - If it's ambiguous or applies to all, use 'ALL'.
+    2. Rewrite the query to be a precise technical search.
+    
+    OUTPUT FORMAT:
+    TARGET_REPO: <repo_name_or_ALL>
+    QUERY: <rewritten_query>
     """
+    
     res = await safe_chat_completion(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}])
-    new_query = res.choices[0].message.content.strip()
-    print(f"   ↳ Resolved: \"{new_query}\"")
-    return new_query
+    content = res.choices[0].message.content.strip()
+    
+    # Parse output
+    target_repo = "ALL"
+    rewritten_query = user_query
+    
+    match_repo = re.search(r"TARGET_REPO:\s*(.+)", content)
+    if match_repo: target_repo = match_repo.group(1).strip()
+    
+    match_query = re.search(r"QUERY:\s*(.+)", content, re.DOTALL)
+    if match_query: rewritten_query = match_query.group(1).strip()
+    
+    print(f"   ↳ Target: [{target_repo}] | Query: \"{rewritten_query}\"")
+    return target_repo, rewritten_query
 
 # --- 4. Symbol Graph Selector ---
 
-async def selector_agent(technical_query, graph):
-    print(f"🗂️  Selector: Picking Function Nodes...", flush=True)
+async def selector_agent(target_repo, technical_query, multi_graph):
+    print(f"🗂️  Selector: Picking Function Nodes in [{target_repo}]...", flush=True)
     
-    # 1. Create a "Menu" for the LLM
-    # We can't dump code. Just signatures.
+    # 1. Determine active graph(s)
+    active_graphs = {}
+    
+    if target_repo == "ALL" or target_repo not in multi_graph:
+        # Flatten all graphs (prefix IDs to avoid collision)
+        for r_name, g_data in multi_graph.items():
+            for node_id, node_data in g_data.items():
+                # Store with unique key: repo::node_id
+                active_graphs[f"{r_name}::{node_id}"] = node_data
+    else:
+        # Use specific repo graph
+        active_graphs = multi_graph[target_repo]
+    
+    if not active_graphs:
+        return []
+
+    # 2. Create Menu
     menu = []
-    for node_id, data in graph.items():
+    # Limit menu size randomly if too big, or use smart sampling
+    keys = list(active_graphs.keys())
+    if len(keys) > 800: keys = keys[:800]
+    
+    for node_id in keys:
+        data = active_graphs[node_id]
         menu.append(f"ID: {node_id} | Type: {data['type']}")
     
-    # If menu is too huge, we might need embeddings. 
-    # For now, let's assume < 500 functions or truncate.
-    menu_str = "\n".join(menu[:800]) # Hard limit for safety
+    menu_str = "\n".join(menu)
 
     prompt = f"""
     You are a Code Navigator.
     Query: "{technical_query}"
+    Context Repo: {target_repo}
     
-    Available Functions/Classes (Nodes):
+    Available Nodes:
     {menu_str}
     
     TASK:
-    Select 2-4 STARTING NODES (IDs) that are most likely to handle the logic for the query.
-    Do not pick utility functions unless core to the query.
-    
-    Return JSON: {{ "seed_nodes": ["file.py::func_name"] }}
+    Select 2-4 STARTING NODES (IDs) most relevant to the query.
+    Return JSON: {{ "seed_nodes": ["node_id_1", "node_id_2"] }}
     """
     
     res = await safe_chat_completion(
@@ -351,13 +402,12 @@ async def selector_agent(technical_query, graph):
     seed_nodes = json.loads(res.choices[0].message.content).get('seed_nodes', [])
     print(f"   🌱 Seeds: {seed_nodes}")
 
-    # 2. Graph Traversal (DFS/BFS)
+    # 3. Traversal
     selected_nodes = set()
     queue = []
     
-    # Validate seeds
     for seed in seed_nodes:
-        if seed in graph:
+        if seed in active_graphs:
             queue.append(seed)
             selected_nodes.add(seed)
 
@@ -365,47 +415,73 @@ async def selector_agent(technical_query, graph):
     while queue and current_depth < MAX_RECURSION_DEPTH:
         next_queue = []
         for current_node_id in queue:
-            node = graph[current_node_id]
+            node = active_graphs[current_node_id]
             deps = node['dependencies']
             
             for dep_id in deps:
-                if dep_id not in selected_nodes:
+                # Handle ID prefixing if we are in ALL mode
+                if dep_id not in active_graphs and target_repo == "ALL":
+                     # Try to find prefixed version? 
+                     # Actually, dependencies inside the node data are already relative to their own graph.
+                     # In ALL mode, we prefixed the KEYS, but the dependency strings inside the values are original.
+                     # We need to re-prefix them to find them in active_graphs.
+                     # This complexity implies ALL mode is tricky.
+                     # Simplified: If ALL, we blindly assume unique filenames or fuzzy match.
+                     # Better: Let's stick to strict matching. If not found, skip.
+                     pass
+                
+                if dep_id in active_graphs and dep_id not in selected_nodes:
                     selected_nodes.add(dep_id)
                     next_queue.append(dep_id)
+                elif target_repo == "ALL":
+                    # Try finding the prefixed key
+                    # Current node key is "repo::file::func". 
+                    # Dependency is "file2::func2".
+                    # We need "repo::file2::func2".
+                    repo_prefix = current_node_id.split("::")[0]
+                    prefixed_dep = f"{repo_prefix}::{dep_id}"
+                    if prefixed_dep in active_graphs and prefixed_dep not in selected_nodes:
+                        selected_nodes.add(prefixed_dep)
+                        next_queue.append(prefixed_dep)
         
         queue = next_queue
         current_depth += 1
 
-    # 3. Construct Context
-    # We group by FILE to avoid repeating imports/globals
-    
-    files_context = {} # filename -> list of function codes
+    # 4. Construct Output
+    files_context = {} 
     
     for node_id in selected_nodes:
-        node = graph[node_id]
-        fname = node['file']
+        node = active_graphs[node_id]
         
-        if fname not in files_context:
-            files_context[fname] = {
+        # In ALL mode, we might want to display Repo Name too
+        fname = node['file']
+        if target_repo == "ALL":
+             # Extract repo from key if needed, or just append to filename
+             repo_prefix = node_id.split("::")[0] if "::" in node_id else "UNKNOWN"
+             display_name = f"[{repo_prefix}] {fname}"
+        else:
+             display_name = fname
+        
+        if display_name not in files_context:
+            files_context[display_name] = {
                 "globals": node['globals'],
                 "functions": []
             }
-        
-        files_context[fname]["functions"].append(node['code'])
+        files_context[display_name]["functions"].append(node['code'])
 
-    # Final Text Construction
     final_output = []
-    for fname, data in files_context.items():
-        block = f"=== FILE: {fname} ===\n"
-        block += f"{data['globals']}\n" # Imports
-        block += "\n# ... (unrelated code hidden) ...\n\n"
+    for name, data in files_context.items():
+        block = f"=== FILE: {name} ===\n"
+        block += f"{data['globals']}\n"
+        block += "\n# ... (hidden) ...\n\n"
         block += "\n\n".join(data['functions'])
         final_output.append(block)
 
-    print(f"   🕸️  Selected {len(selected_nodes)} functions across {len(files_context)} files.")
+    print(f"   🕸️  Selected {len(selected_nodes)} functions.")
     return final_output
 
 # --- 5. Answering Agent ---
+
 async def answering_agent(user_query, context_strings):
     print("📝 Answering Agent: Generating response...", flush=True)
     full_context = "\n".join(context_strings)
@@ -419,6 +495,7 @@ async def answering_agent(user_query, context_strings):
     return res.choices[0].message.content
 
 # --- Main Orchestrator ---
+
 async def main():
     chat_history = []
     try:
@@ -426,27 +503,30 @@ async def main():
         gh_input = input("\n🐙 Enter GitHub Repos (comma-separated): ")
         if not gh_input.strip(): return
 
-        files_data = await ingest_sources(gh_input)
-        if not files_data: return
+        # Load separate repos
+        multi_repo_data = await ingest_sources(gh_input)
+        if not multi_repo_data: return
 
-        # 1. Build Function Graph (AST)
-        graph = await build_symbol_graph(files_data)
+        # Build isolated graphs
+        multi_graph = await build_multi_symbol_graph(multi_repo_data)
+        
+        available_repos = list(multi_graph.keys())
         
         while True:
             query = input("\n" + "-"*40 + "\n(Type 'exit' to quit) Question: ")
             if query.lower() in ['exit', 'quit']: break
             
-            # 2. Reframe
-            technical_query = await reframer_agent(query, chat_history)
+            # Reframe with Repo Awareness
+            target_repo, technical_query = await reframer_agent(query, chat_history, available_repos)
             
-            # 3. Select (Function Graph Traversal)
-            context_strings = await selector_agent(technical_query, graph)
+            # Select from Specific Graph
+            context_strings = await selector_agent(target_repo, technical_query, multi_graph)
             
             if not context_strings:
                 print("   ⚠️ No relevant code found.")
                 continue
 
-            # 4. Answer
+            # Answer
             answer = await answering_agent(query, context_strings)
             print("\n" + "="*60 + f"\n✅ ANSWER:\n{answer}\n" + "="*60)
             
