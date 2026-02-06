@@ -6,7 +6,7 @@ import stat
 import errno
 import sys
 import re
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Union
 from git import Repo
 from openai import AsyncOpenAI
 from pypdf import PdfReader
@@ -21,19 +21,22 @@ except ImportError:
 # --- Configuration ---
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL_NAME = "gpt-4o-mini"
+
+# Graph Configuration
+MAX_RECURSION_DEPTH = 5   # Trace dependencies 5 levels deep
+MAX_CONCURRENCY = 50 
+MAX_CONTEXT_CHARS = 200000 
 
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY not found in .env. Please set it.")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Paths & Limits
+# Paths
 TEMP_DIR = "./temp_session_data"
 SUMMARIES_DIR = "./repo_summaries"
 KNOWLEDGE_BASE_FILE = "session_knowledge.json"
-
-MAX_CONCURRENCY = 50 
-MAX_CONTEXT_CHARS = 200000 
 
 # --- Helper: Force Delete Read-Only Files ---
 def handle_remove_readonly(func, path, exc):
@@ -140,7 +143,6 @@ async def handle_github_repo(url, source_id):
         print(f"❌ Git Clone Failed: {e}")
         return None
 
-# --- Ingestion Orchestrator ---
 async def ingest_sources(github_inputs: str):
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR, onerror=handle_remove_readonly)
     os.makedirs(TEMP_DIR, exist_ok=True)
@@ -150,14 +152,12 @@ async def ingest_sources(github_inputs: str):
     
     git_urls = [s.strip() for s in github_inputs.split(',') if s.strip()]
     
-    # Collect Directories
     dir_tasks = []
     for i, url in enumerate(git_urls):
         dir_tasks.append(handle_github_repo(url, i))
         
     local_dirs = await asyncio.gather(*dir_tasks)
     
-    # Walk Directories
     for local_dir in local_dirs:
         if not local_dir: continue
         for root, _, files in os.walk(local_dir):
@@ -179,59 +179,62 @@ async def ingest_sources(github_inputs: str):
     print(f"\n✅ Total Loaded: {len(files_data)} items.")
     return files_data
 
-# --- 2. Strict Graph Summarizer ---
-async def generate_rich_summary(sem, filename, content, counter, total):
+# --- 2. Symbol Graph Summarizer (Advanced) ---
+
+async def generate_symbol_graph(sem, filename, content, counter, total):
     async with sem:
+        # We ask for "Exports" (what is defined) and "Dependencies" (what is used)
         prompt = f"""
-        Analyze this file for a Code Knowledge Graph.
+        Analyze this code file for a Granular Dependency Graph.
         File: {filename}
         
         TASK:
-        1. Summarize purpose.
-        2. Extract STRICT Functional Dependencies (Imports/Inheritance).
+        1. List 'exports': Major Classes and Functions defined in this file.
+        2. List 'dependencies': External files AND the specific symbols (classes/funcs) used from them.
         
-        CRITICAL RULES:
-        - ONLY list code files that are imported.
-        - IGNORE doc files (.md, .txt) unless strictly relevant.
-        
-        Content Snippet:
+        Content Snippet (First 15k chars):
         {content[:15000]}
         
         Return JSON: {{ 
-            "dense_summary": {{ 
-                "purpose": "string", 
-                "dependencies": ["utils.py", "models/user.py"] 
-            }} 
+            "purpose": "Brief summary",
+            "exports": ["class UserManager", "def validate_email"],
+            "dependencies": [
+                {{ "filename": "database.py", "symbols_used": ["class DBConnection", "def connect"] }}
+            ]
         }}
         """
         try:
             res = await safe_chat_completion(
-                model="gpt-4o-mini",
+                model=MODEL_NAME,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}
             )
             data = json.loads(res.choices[0].message.content)
-            if "dense_summary" not in data: data["dense_summary"] = {"purpose": "Error", "dependencies": []}
+            
+            if "exports" not in data: data["exports"] = []
+            if "dependencies" not in data: data["dependencies"] = []
+            
             counter[0] += 1
-            print(f"   [ {counter[0]}/{total} ] Analyzed: {os.path.basename(filename)}")
+            print(f"   [ {counter[0]}/{total} ] Mapped Symbols: {os.path.basename(filename)}")
             return data
-        except:
+        except Exception as e:
             counter[0] += 1
-            return {"dense_summary": {"purpose": "Error", "dependencies": []}}
+            return {"purpose": "Error", "exports": [], "dependencies": []}
 
 async def summarizer_agent(files_data):
-    print("\n🕵️  Summarizer Agent: Building Graph...")
+    print("\n🕵️  Summarizer Agent: Building Symbol Graph...")
     if os.path.exists(SUMMARIES_DIR): shutil.rmtree(SUMMARIES_DIR, onerror=handle_remove_readonly)
     os.makedirs(SUMMARIES_DIR)
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
     counter, total = [0], len(files_data)
-    tasks = [generate_rich_summary(sem, f, d['content'], counter, total) for f, d in files_data.items()]
+    
+    tasks = [generate_symbol_graph(sem, f, d['content'], counter, total) for f, d in files_data.items()]
     results = await asyncio.gather(*tasks)
 
     knowledge_base = {}
     for filename, result in zip(files_data.keys(), results):
-        knowledge_base[filename] = result['dense_summary']
+        knowledge_base[filename] = result
 
     with open(KNOWLEDGE_BASE_FILE, 'w') as f: json.dump(knowledge_base, f, indent=2)
     return knowledge_base
@@ -243,122 +246,166 @@ async def reframer_agent(user_query, chat_history):
     for turn in chat_history[-3:]: history_text += f"{turn['role'].upper()}: {turn['content']}\n"
 
     prompt = f"""
-    You are a Technical Assistant. Rewrite the user's query into a precise search query.
+    Rewrite the user's query into a precise technical search query.
     History: {history_text}
     Query: "{user_query}"
-    Guidelines:
-    1. Resolve pronouns (it, that).
-    2. Detect topic shifts (new topic = ignore old history).
-    3. Return ONLY the rewritten query.
+    Return ONLY the rewritten query.
     """
-    res = await safe_chat_completion(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}])
+    res = await safe_chat_completion(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}])
     new_query = res.choices[0].message.content.strip()
     print(f"   ↳ Resolved Query: \"{new_query}\"")
     return new_query
 
-# --- 4. Intelligent Selector (With Pruning) ---
+# --- 4. Deep Graph Selector & Slicer ---
 
-async def smart_filter_dependencies(query, parent_file, potential_deps, all_files):
-    if not potential_deps: return []
-    real_candidates = []
-    
-    # Fuzzy match dependencies to file list
-    for dep in potential_deps:
-        matches = [f for f in all_files if dep in f or f.endswith(dep)]
-        if matches: real_candidates.append(min(matches, key=len)) 
-    
-    if not real_candidates: return []
+async def extract_relevant_code(filename, full_content, symbols_needed):
+    """
+    Uses LLM to slice the file and return ONLY the requested functions/classes.
+    """
+    if not symbols_needed:
+        # If explicitly no symbols, maybe just return headers.
+        return f"--- Snippet from {filename} (Headers Only) ---\n{full_content[:1000]}\n...(truncated)...\n"
 
     prompt = f"""
-    User Query: "{query}"
-    File: "{parent_file}" imports {json.dumps(real_candidates)}
+    You are a Code Slicer. 
+    File: {filename}
+    Target Symbols: {json.dumps(list(symbols_needed))}
     
-    Task: Return ONLY the imported files likely to contain logic relevant to the query.
-    Return JSON: {{ "relevant_dependencies": ["file1.py"] }}
+    TASK:
+    Return ONLY the code blocks (function definitions, class definitions) for the Target Symbols.
+    Include necessary imports at the top.
+    DO NOT summarize. Return actual code.
+    
+    Code Context:
+    {full_content[:40000]} 
     """
+    
     try:
         res = await safe_chat_completion(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}]
         )
-        return json.loads(res.choices[0].message.content).get('relevant_dependencies', [])
+        return f"--- Snippet from {filename} (Filtered for: {', '.join(symbols_needed)}) ---\n{res.choices[0].message.content}\n"
     except:
-        return real_candidates 
+        return f"--- {filename} ---\n{full_content[:5000]}\n" 
 
-async def selector_agent(technical_query, knowledge_base, files_data, feedback: Optional[str] = None):
-    print(f"🗂️  Selector: Hunting for relevant files...", flush=True)
+async def selector_agent(technical_query, knowledge_base, files_data):
+    print(f"🗂️  Selector: Tracing Recursive Dependency Chain (Depth {MAX_RECURSION_DEPTH})...", flush=True)
     
-    index_view = {k: v['purpose'] for k, v in knowledge_base.items()}
+    # 1. Identify Seeds
+    index_view = {k: {"purpose": v.get('purpose'), "exports": v.get('exports')} for k, v in knowledge_base.items()}
+    
     prompt = f"""
-    Select 3-5 'Seed Files' for: "{technical_query}"
+    Identify 2-3 Seed Files for: "{technical_query}"
+    Look at 'exports' to find the code owners.
     Index: {json.dumps(index_view)}
-    Return JSON: {{ "seed_files": ["file1", "file2"] }}
+    Return JSON: {{ "seed_files": ["main.py", "logic.py"] }}
     """
     
     res = await safe_chat_completion(
-        model="gpt-4o-mini",
+        model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
-    
-    try:
-        data = json.loads(res.choices[0].message.content)
-        seed_files = [f for f in data.get('seed_files', []) if f in files_data]
-        print(f"   🌱 Seeds: {seed_files}")
-        
-        final_selection_set = set(seed_files)
-        all_filenames = list(files_data.keys())
+    seed_files = json.loads(res.choices[0].message.content).get('seed_files', [])
+    print(f"   🌱 Seeds: {seed_files}")
 
-        print("   🕸️  Traversing & Pruning Graph...")
-        for seed in seed_files:
-            if seed.endswith(('.md', '.txt', '.rst')): continue
-            
-            raw_deps = knowledge_base[seed].get("dependencies", [])
-            relevant_deps = await smart_filter_dependencies(technical_query, seed, raw_deps, all_filenames)
-            
-            for dep in relevant_deps:
-                if dep in files_data and dep not in final_selection_set:
-                    print(f"      🔗 Linked (Relevant): {seed} -> {dep}")
-                    final_selection_set.add(dep)
+    # "requirements" maps: Real Filename -> Set of Symbols Needed
+    # If Set is "ALL", we load the full file (only for seeds).
+    requirements: Dict[str, Union[str, Set[str]]] = {} 
+    
+    # Queue for BFS: List of Real Filenames
+    queue = []
+
+    # Initialize Seeds
+    for seed in seed_files:
+        real_seed = next((f for f in files_data.keys() if seed in f), None)
+        if real_seed:
+            requirements[real_seed] = "ALL"  # Seeds are loaded fully (change to set() if you want seeds sliced too)
+            queue.append(real_seed)
+
+    # 2. BFS Traversal (Up to Depth 5)
+    current_depth = 0
+    while queue and current_depth < MAX_RECURSION_DEPTH:
+        # print(f"      📍 Depth {current_depth}: Processing {len(queue)} files...")
+        next_queue = []
         
-        final_selection = []
-        current_chars = 0
-        for fname in final_selection_set:
-            f_len = len(files_data[fname]['content'])
-            if current_chars + f_len > MAX_CONTEXT_CHARS:
-                print(f"   ⚠️ Limit reached. Skipping {fname}")
-                continue
-            final_selection.append(fname)
-            current_chars += f_len
+        for current_file in queue:
+            if current_file not in knowledge_base: continue
             
-        return final_selection
-    except Exception as e:
-        print(f"Selector Error: {e}")
-        return []
+            # Get dependencies of current file
+            deps = knowledge_base[current_file].get("dependencies", [])
+            
+            for dep in deps:
+                dep_name_ref = dep.get("filename")
+                symbols_needed = set(dep.get("symbols_used", []))
+                
+                # Find valid file
+                real_dep_file = next((f for f in files_data.keys() if dep_name_ref in f), None)
+                if not real_dep_file: continue
+                
+                # If we haven't seen this file, add it
+                if real_dep_file not in requirements:
+                    requirements[real_dep_file] = symbols_needed
+                    next_queue.append(real_dep_file)
+                else:
+                    # If we have seen it, MERGE symbols (unless it's already ALL)
+                    if requirements[real_dep_file] != "ALL":
+                        requirements[real_dep_file].update(symbols_needed)
+
+        queue = next_queue
+        current_depth += 1
+
+    # 3. Generate Context (Slicing)
+    final_context = []
+    current_chars = 0
+    
+    # Sort files to put seeds first
+    sorted_files = sorted(requirements.keys(), key=lambda k: 0 if requirements[k] == "ALL" else 1)
+
+    print(f"      ✂️  Slicing {len(sorted_files)} files for context...")
+    
+    for fname in sorted_files:
+        if current_chars > MAX_CONTEXT_CHARS:
+            print(f"   ⚠️ Context limit reached. Stopping at {fname}")
+            break
+            
+        reqs = requirements[fname]
+        content = files_data[fname]['content']
+        
+        if reqs == "ALL":
+            # Full Content (Seed)
+            chunk = f"=== FOCUS FILE: {fname} ===\n{content}\n"
+        else:
+            # Sliced Content (Dependency)
+            symbol_list = list(reqs)
+            chunk = await extract_relevant_code(fname, content, symbol_list)
+            
+        final_context.append(chunk)
+        current_chars += len(chunk)
+
+    return final_context
 
 # --- 5. Answering Agent ---
-async def answering_agent(user_query, selected_files, files_data):
+async def answering_agent(user_query, context_strings):
     print("📝 Answering Agent: Generating response...", flush=True)
-    context = ""
-    for fname in selected_files:
-        if fname in files_data:
-            context += f"\n=== {fname} ===\n{files_data[fname]['content']}\n"
-            
+    
+    full_context = "\n".join(context_strings)
+    
     res = await safe_chat_completion(
-        model="gpt-4o-mini",
+        model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "You are a senior developer. Answer based strictly on the context."},
-            {"role": "user", "content": f"Query: {user_query}\n\nContext:\n{context}"}
+            {"role": "system", "content": "You are a senior developer. Answer based strictly on the provided Code Context. Cite which file logic comes from."},
+            {"role": "user", "content": f"Query: {user_query}\n\nCode Context:\n{full_context}"}
         ]
     )
-    return res.choices[0].message.content, context
+    return res.choices[0].message.content
 
 # --- Main Orchestrator ---
 async def main():
     chat_history = []
     try:
-        print("🔗 === SOURCE CONFIGURATION === 🔗")
+        print("🔗 === GITHUB SOURCE CONFIGURATION === 🔗")
         
         gh_input = input("\n🐙 Enter GitHub Repos (comma-separated): ")
         
@@ -372,7 +419,7 @@ async def main():
             print("❌ No valid data loaded.")
             return
 
-        # 1. Summarize
+        # 1. Summarize (Symbol Level)
         knowledge_base = await summarizer_agent(files_data)
         
         while True:
@@ -382,11 +429,15 @@ async def main():
             # 2. Reframe
             technical_query = await reframer_agent(query, chat_history)
             
-            # 3. Select (Seed + Pruned Graph)
-            selected_files = await selector_agent(technical_query, knowledge_base, files_data)
+            # 3. Select & Slice (Recursive Depth 5)
+            context_strings = await selector_agent(technical_query, knowledge_base, files_data)
             
+            if not context_strings:
+                print("   ⚠️ No relevant code found.")
+                continue
+
             # 4. Answer
-            answer, context = await answering_agent(query, selected_files, files_data)
+            answer = await answering_agent(query, context_strings)
             
             print("\n" + "="*60 + f"\n✅ ANSWER:\n{answer}\n" + "="*60)
             
