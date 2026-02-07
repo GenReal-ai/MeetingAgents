@@ -121,6 +121,9 @@ INCLUDE_FILE_HEADER = True  # Include file-level docstrings/comments
 # Embedding Configuration
 EMBEDDING_BATCH_SIZE = 100
 TOP_K_SEEDS = 5
+BACKWARD_TRAVERSAL_DEPTH = 3
+INCLUDE_HIGH_LEVEL_CONTEXT = True
+MAX_SUMMARY_TOKENS = 4000
 
 # Cache Configuration
 CACHE_DIR = "./pipeline_cache"
@@ -1280,7 +1283,96 @@ class TreeSitterParser:
         
         return {"nodes": nodes, "imports": [], "globals": ""}
 
-# --- 3. Import Resolution System ---
+# --- 3. Project Summarization System ---
+
+class ProjectSummarizer:
+    """
+    Generates high-level summaries of files and the overall project architecture.
+    Uses LLM to synthesize information for broader context.
+    """
+    
+    def __init__(self, model_name: str = MODEL_NAME):
+        self.model_name = model_name
+        self.file_summaries = {}
+        self.project_summary = ""
+
+    async def summarize_file(self, filename: str, content: str, nodes: List[Dict]) -> str:
+        """Generate a concise summary of a single file."""
+        node_names = [n['name'] for n in nodes[:10]]
+        node_str = ", ".join(node_names)
+        
+        prompt = f"""
+Summarize the following file in 1-2 concise sentences. 
+Focus on its primary responsibility in the system.
+Filename: {filename}
+Key Symbols: {node_str}
+Content Preview: {content[:1000]}
+"""
+        try:
+            res = await safe_chat_completion(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            summary = res.choices[0].message.content.strip()
+            self.file_summaries[filename] = summary
+            return summary
+        except Exception as e:
+            print(f"   ⚠️ Summary failed for {filename}: {e}")
+            return f"Module containing {node_str}"
+
+    async def generate_project_overview(self, multi_graph: Dict[str, Dict]) -> str:
+        """Synthesize project-level architecture summary."""
+        print("🧠 Generating project architectural overview...", flush=True)
+        
+        file_overviews = []
+        for repo, graph in multi_graph.items():
+            repo_files = set()
+            for node_id, data in graph.items():
+                repo_files.add(data['file'])
+            
+            # Use only a subset if too many
+            subset = list(repo_files)[:30]
+            summaries = [f"- {f}: {self.file_summaries.get(f, 'Source file')}" for f in subset]
+            file_overviews.append(f"Repo [{repo}]:\n" + "\n".join(summaries))
+        
+        all_files_str = "\n\n".join(file_overviews)
+        
+        prompt = f"""
+Given the following list of files and their short descriptions, provide a high-level architectural overview of the project.
+Describe the main components, how they interact, and the overall purpose of the system.
+Keep it under 3-4 paragraphs.
+
+{all_files_str}
+"""
+        try:
+            res = await safe_chat_completion(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            self.project_summary = res.choices[0].message.content.strip()
+            return self.project_summary
+        except Exception as e:
+            print(f"   ⚠️ Project overview failed: {e}")
+            return "Multi-repository software project."
+
+    def save(self, filepath: str):
+        """Save summaries to disk."""
+        data = {
+            "file_summaries": self.file_summaries,
+            "project_summary": self.project_summary
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def load(self, filepath: str):
+        """Load summaries from disk."""
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+                self.file_summaries = data.get("file_summaries", {})
+                self.project_summary = data.get("project_summary", "")
+
+# --- 4. Import Resolution System ---
 
 class ImportResolver:
     """Resolves imports to enable namespace-aware linking."""
@@ -1598,8 +1690,8 @@ def link_cross_repo_dependencies(multi_graph: Dict[str, Dict]) -> Dict[str, Dict
     
     return multi_graph
 
-async def build_multi_symbol_graph(multi_repo_data: Dict[str, Dict]) -> Tuple[Dict, Dict]:
-    """Build graphs for all repos with embeddings."""
+async def build_multi_symbol_graph(multi_repo_data: Dict[str, Dict], summarizer: ProjectSummarizer) -> Tuple[Dict, Dict]:
+    """Build graphs for all repos with embeddings and summaries."""
     print("\n🕵️ Building symbol graphs with enhanced parsing...")
     
     multi_graph = {}
@@ -1607,10 +1699,23 @@ async def build_multi_symbol_graph(multi_repo_data: Dict[str, Dict]) -> Tuple[Di
     
     for repo_name, files_data in multi_repo_data.items():
         graph, resolver = await build_single_repo_graph(repo_name, files_data)
+        
+        # Project Summarization: Summarize each file
+        print(f"   📝 Summarizing {len(files_data)} files in [{repo_name}]...")
+        for filename, data in files_data.items():
+            nodes = graph.get(filename, {}).get('nodes', []) # This is wrong, graph is node_id based
+            # Let's fix this: group nodes by file
+            file_nodes = [nd for nid, nd in graph.items() if nd['file'] == filename]
+            # nodes in build_single_repo_graph are internal, let's just pass some context
+            await summarizer.summarize_file(filename, data['content'], [{"name": k.split("::")[-1]} for k in graph.keys() if graph[k]['file'] == filename])
+            
         multi_graph[repo_name] = graph
         resolvers[repo_name] = resolver
     
     multi_graph = link_cross_repo_dependencies(multi_graph)
+    
+    # Generate project level overview
+    await summarizer.generate_project_overview(multi_graph)
     
     vector_stores = {}
     
@@ -1632,19 +1737,68 @@ async def build_multi_symbol_graph(multi_repo_data: Dict[str, Dict]) -> Tuple[Di
 
 # --- Enhanced Selector ---
 
+def _extract_specific_targets(query: str, hints: List[str], active_graph: Dict) -> Set[str]:
+    """Extract matching node IDs based on hints from reframer."""
+    targets = set()
+    node_keys = list(active_graph.keys())
+    
+    for hint in hints:
+        hint_lower = hint.lower()
+        # Direct match
+        if hint in active_graph:
+            targets.add(hint)
+            continue
+            
+        # Partial match
+        for key in node_keys:
+            if hint_lower in key.lower():
+                targets.add(key)
+                
+    return targets
+
+def _backward_traverse(
+    seed_nodes: Set[str],
+    active_graph: Dict,
+    max_depth: int = BACKWARD_TRAVERSAL_DEPTH
+) -> Set[str]:
+    """
+    Traverse from seeds to find all functions they call (callees).
+    This builds the call chain: func1 calls func2, func2 calls func3.
+    """
+    selected = set(seed_nodes)
+    queue = list(seed_nodes)
+    depth = 0
+    
+    while queue and depth < max_depth:
+        next_queue = []
+        for node_id in queue:
+            node = active_graph.get(node_id)
+            if not node:
+                continue
+                
+            for dep_id in node.get('dependencies', []):
+                if dep_id in active_graph and dep_id not in selected:
+                    selected.add(dep_id)
+                    next_queue.append(dep_id)
+        queue = next_queue
+        depth += 1
+    return selected
+
 async def selector_agent_enhanced(
     target_repo: str,
     technical_query: str,
     multi_graph: Dict[str, Dict],
-    vector_stores: Dict[str, VectorEmbeddingStore]
+    vector_stores: Dict[str, VectorEmbeddingStore],
+    query_type: str = "FUNCTIONAL_AREA",
+    hints: List[str] = None,
+    summarizer: ProjectSummarizer = None
 ) -> List[str]:
-    """Enhanced selector using vector search + graph traversal."""
-    print(f"🗂️ Selector: Finding relevant nodes in [{target_repo}]...", flush=True)
+    """Enhanced selector using vector search, graph traversal, and summaries."""
+    print(f"🗂️ Selector: Strategy [{query_type}] in [{target_repo}]...", flush=True)
     
     if target_repo == "ALL" or target_repo not in multi_graph:
         active_graph = {}
         active_stores = {}
-        
         for r_name, g_data in multi_graph.items():
             for node_id, node_data in g_data.items():
                 prefixed_id = f"{r_name}::{node_id}"
@@ -1654,75 +1808,44 @@ async def selector_agent_enhanced(
         active_graph = {k: v for k, v in multi_graph[target_repo].items()}
         active_stores = {target_repo: vector_stores.get(target_repo)}
     
-    if not active_graph:
+    if not active_graph and query_type != "HIGH_LEVEL":
         return []
     
-    seed_nodes = set()
-    
-    for repo, store in active_stores.items():
-        if store and HAS_FAISS:
-            search_results = await store.search(technical_query, k=TOP_K_SEEDS)
-            
-            for result_id in search_results:
-                if target_repo == "ALL":
-                    prefixed = f"{repo}::{result_id}"
-                    if prefixed in active_graph:
-                        seed_nodes.add(prefixed)
-                else:
-                    if result_id in active_graph:
-                        seed_nodes.add(result_id)
-    
-    if not seed_nodes:
-        print("   ⚠️ Vector search returned no results, using LLM fallback...")
-        seed_nodes = await llm_seed_selection(technical_query, active_graph)
-    
-    print(f"   🌱 Seeds: {list(seed_nodes)[:5]}{'...' if len(seed_nodes) > 5 else ''}")
-    
-    selected_nodes = set(seed_nodes)
-    queue = list(seed_nodes)
-    current_depth = 0
-    
-    while queue and current_depth < MAX_RECURSION_DEPTH:
-        next_queue = []
+    selected_nodes = set()
+    extra_context = []
+
+    # Strategy 1: HIGH_LEVEL - Include Project & File Summaries
+    if query_type == "HIGH_LEVEL" and summarizer:
+        extra_context.append(f"=== PROJECT ARCHITECTURAL OVERVIEW ===\n\n{summarizer.project_summary}")
+        # Also include top file summaries
+        file_sum_str = "\n".join([f"- {f}: {s}" for f, s in list(summarizer.file_summaries.items())[:20]])
+        extra_context.append(f"=== FILE SUMMARIES ===\n\n{file_sum_str}")
         
-        for current_node_id in queue:
-            if current_node_id not in active_graph:
-                continue
-            
-            node = active_graph[current_node_id]
-            
-            for dep_id in node.get('dependencies', []):
-                if dep_id in active_graph and dep_id not in selected_nodes:
-                    selected_nodes.add(dep_id)
-                    next_queue.append(dep_id)
-            
-            for cross_dep in node.get('cross_repo_deps', []):
-                target_repo_name = cross_dep['repo']
-                target_node_id = cross_dep['node_id']
-                
-                if target_repo == "ALL":
-                    full_id = f"{target_repo_name}::{target_node_id}"
-                else:
-                    if target_repo_name in multi_graph:
-                        if target_node_id in multi_graph[target_repo_name]:
-                            full_id = f"{target_repo_name}::{target_node_id}"
-                            active_graph[full_id] = multi_graph[target_repo_name][target_node_id]
-                        else:
-                            continue
-                    else:
-                        continue
-                
-                if full_id not in selected_nodes:
-                    selected_nodes.add(full_id)
-                    next_queue.append(full_id)
+    # Strategy 2: SPECIFIC - Backward traversal from hints
+    if (query_type == "SPECIFIC" or hints) and active_graph:
+        specific_seeds = _extract_specific_targets(technical_query, hints or [], active_graph)
+        if specific_seeds:
+            print(f"   � Target Seeds: {list(specific_seeds)[:3]}")
+            selected_nodes.update(_backward_traverse(specific_seeds, active_graph))
+
+    # Strategy 3: Vector Fallback / FUNCTIONAL_AREA
+    if not selected_nodes and active_graph:
+        seed_nodes = set()
+        for repo, store in active_stores.items():
+            if store and HAS_FAISS:
+                search_results = await store.search(technical_query, k=TOP_K_SEEDS)
+                for result_id in search_results:
+                    full_id = f"{repo}::{result_id}" if target_repo == "ALL" else result_id
+                    if full_id in active_graph:
+                        seed_nodes.add(full_id)
         
-        queue = next_queue
-        current_depth += 1
-    
+        if not seed_nodes:
+            seed_nodes = await llm_seed_selection(technical_query, active_graph)
+            
+        selected_nodes.update(_backward_traverse(seed_nodes, active_graph, max_depth=MAX_RECURSION_DEPTH))
+
     context_strings = build_context_with_budget(selected_nodes, active_graph, target_repo)
-    
-    print(f"   🕸️ Selected {len(selected_nodes)} nodes, context size: {sum(count_tokens(s) for s in context_strings)} tokens")
-    return context_strings
+    return extra_context + context_strings
 
 async def llm_seed_selection(query: str, active_graph: Dict) -> Set[str]:
     """Fallback LLM-based seed selection."""
@@ -1805,9 +1928,9 @@ def build_context_with_budget(
 
 # --- Reframer ---
 
-async def reframer_agent(user_query: str, chat_history: List[Dict], available_repos: List[str]) -> Tuple[str, str]:
-    """Detect target repo and rewrite query."""
-    print("🧠 Reframer: Detecting target repo...", flush=True)
+async def reframer_agent(user_query: str, chat_history: List[Dict], available_repos: List[str]) -> Dict[str, Any]:
+    """Detect target repo, query type, and architectural hints."""
+    print("🧠 Reframer: Analyzing query...", flush=True)
     
     history_text = ""
     for turn in chat_history[-3:]:
@@ -1825,33 +1948,52 @@ Conversation History:
 Current Query: "{user_query}"
 
 TASK:
-1. Determine which Repository the user is referring to.
-   - If they mention a specific repo name, use that.
-   - If context implies one, use that.
-   - If ambiguous or applies to all, use 'ALL'.
-2. Rewrite the query to be a precise technical search.
+1. Determine the TARGET_REPO (name or 'ALL').
+2. Classify QUERY_TYPE as one of:
+   - 'SPECIFIC': User asks about a specific function, class, or bug in a known terminal node.
+   - 'FUNCTIONAL_AREA': User asks about a feature, module, or broader capability.
+   - 'HIGH_LEVEL': User asks about architecture, overview, or "how things work" generally.
+3. Extract HINTS: List any filenames, function names, or class names mentioned or implied.
+4. Rewrite the QUERY for better retrieval.
 
 OUTPUT FORMAT:
-TARGET_REPO: <repo_name_or_ALL>
+TARGET_REPO: <repo>
+QUERY_TYPE: <type>
+HINTS: ["hint1", "hint2"]
 QUERY: <rewritten_query>
 """
     
     res = await safe_chat_completion(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}])
     content = res.choices[0].message.content.strip()
     
-    target_repo = "ALL"
-    rewritten_query = user_query
+    result = {
+        "target_repo": "ALL",
+        "query_type": "FUNCTIONAL_AREA",
+        "hints": [],
+        "query": user_query
+    }
     
     match_repo = re.search(r"TARGET_REPO:\s*(.+)", content)
     if match_repo:
-        target_repo = match_repo.group(1).strip()
+        result["target_repo"] = match_repo.group(1).strip()
+    
+    match_type = re.search(r"QUERY_TYPE:\s*(.+)", content)
+    if match_type:
+        result["query_type"] = match_type.group(1).strip()
+        
+    match_hints = re.search(r"HINTS:\s*(\[.+\])", content)
+    if match_hints:
+        try:
+            result["hints"] = json.loads(match_hints.group(1))
+        except:
+            pass
     
     match_query = re.search(r"QUERY:\s*(.+)", content, re.DOTALL)
     if match_query:
-        rewritten_query = match_query.group(1).strip()
+        result["query"] = match_query.group(1).strip()
     
-    print(f"   ↳ Target: [{target_repo}] | Query: \"{rewritten_query}\"")
-    return target_repo, rewritten_query
+    print(f"   ↳ Target: [{result['target_repo']}] | Type: {result['query_type']} | Hints: {result['hints']}")
+    return result
 
 # --- Answering Agent ---
 
@@ -1895,10 +2037,9 @@ async def answering_agent(user_query: str, context_strings: List[str]) -> str:
 
 # --- Cache Management ---
 
-def save_cache(multi_graph: Dict, vector_stores: Dict, repo_hashes: Dict):
-    """Save graph and embeddings to cache."""
+def save_cache(multi_graph: Dict, vector_stores: Dict, repo_hashes: Dict, summarizer: ProjectSummarizer):
+    """Save graph, embeddings, and summaries to cache."""
     print("💾 Saving cache...")
-    # Ensure cache directory exists
     os.makedirs(CACHE_DIR, exist_ok=True)
 
     cache_data = {
@@ -1910,14 +2051,17 @@ def save_cache(multi_graph: Dict, vector_stores: Dict, repo_hashes: Dict):
     with open(CACHE_FILE, 'w') as f:
         json.dump(cache_data, f, indent=2)
 
-    # Save vector indices in cache directory
+    # Save vector indices
     for repo_name, store in vector_stores.items():
         index_path = os.path.join(CACHE_DIR, f"{repo_name}.faiss")
         store.save(index_path)
+    
+    # Save summaries
+    summarizer.save(os.path.join(CACHE_DIR, "summaries.json"))
 
     print(f"   ✅ Cache saved to {CACHE_DIR}")
 
-def load_cache(current_hashes: Dict) -> Optional[Tuple[Dict, Dict]]:
+def load_cache(current_hashes: Dict, summarizer: ProjectSummarizer) -> Optional[Tuple[Dict, Dict]]:
     """Load cache if valid."""
     if not os.path.exists(CACHE_FILE):
         return None
@@ -1927,16 +2071,13 @@ def load_cache(current_hashes: Dict) -> Optional[Tuple[Dict, Dict]]:
             cache_data = json.load(f)
         
         cached_hashes = cache_data.get('repo_hashes', {})
-        
         if cached_hashes != current_hashes:
             print("⚠️ Repository changes detected, invalidating cache")
             return None
         
         print("✅ Loading from cache...")
-        
         multi_graph = cache_data['graph']
         
-        # Load vector stores from cache directory
         vector_stores = {}
         for repo_name in multi_graph.keys():
             store = VectorEmbeddingStore()
@@ -1945,8 +2086,10 @@ def load_cache(current_hashes: Dict) -> Optional[Tuple[Dict, Dict]]:
                 store.load(index_path)
                 vector_stores[repo_name] = store
         
+        # Load summaries
+        summarizer.load(os.path.join(CACHE_DIR, "summaries.json"))
+        
         return multi_graph, vector_stores
-    
     except Exception as e:
         print(f"⚠️ Cache load error: {e}")
         return None
@@ -1956,6 +2099,7 @@ def load_cache(current_hashes: Dict) -> Optional[Tuple[Dict, Dict]]:
 async def main():
     chat_history = []
     init_cache_dir()
+    summarizer = ProjectSummarizer()
 
     try:
         print("🔗 === GITHUB SOURCE CONFIGURATION === 🔗")
@@ -1967,13 +2111,13 @@ async def main():
         if not multi_repo_data:
             return
         
-        cached = load_cache(repo_hashes)
+        cached = load_cache(repo_hashes, summarizer)
         
         if cached:
             multi_graph, vector_stores = cached
         else:
-            multi_graph, vector_stores = await build_multi_symbol_graph(multi_repo_data)
-            save_cache(multi_graph, vector_stores, repo_hashes)
+            multi_graph, vector_stores = await build_multi_symbol_graph(multi_repo_data, summarizer)
+            save_cache(multi_graph, vector_stores, repo_hashes, summarizer)
         
         available_repos = list(multi_graph.keys())
         
@@ -1982,10 +2126,6 @@ async def main():
         
         if total_nodes == 0:
             print("\n⚠️ Warning: No code symbols were extracted from the repository.")
-            print("   This could be because:")
-            print("   - The repository contains primarily non-code files")
-            print("   - The files use unsupported languages")
-            print("   - Tree-sitter parsers are not installed")
             print("\n   You can still ask questions, but responses may be limited.")
         
         print(f"\n✅ System ready! Found {total_nodes} symbols across {len(available_repos)} repo(s).")
@@ -1996,13 +2136,16 @@ async def main():
             if query.lower() in ['exit', 'quit']:
                 break
             
-            target_repo, technical_query = await reframer_agent(query, chat_history, available_repos)
+            reframer_res = await reframer_agent(query, chat_history, available_repos)
             
             context_strings = await selector_agent_enhanced(
-                target_repo,
-                technical_query,
+                reframer_res["target_repo"],
+                reframer_res["query"],
                 multi_graph,
-                vector_stores
+                vector_stores,
+                query_type=reframer_res["query_type"],
+                hints=reframer_res["hints"],
+                summarizer=summarizer
             )
             
             if not context_strings:
