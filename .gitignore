@@ -1,3 +1,7 @@
 .env
 credentials.json
 Test.py
+cache_data
+pipeline_cache
+temp_repo_data
+temp_session_data
