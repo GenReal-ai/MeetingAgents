@@ -115,14 +115,17 @@ MAX_RECURSION_DEPTH = 3
 MAX_CONCURRENCY = 50 
 MAX_CONTEXT_CHARS = 200000 
 MAX_CONTEXT_TOKENS = 30000
+EXTRACT_GLOBALS_LINES = 50  # Number of lines from top of file to extract
+INCLUDE_FILE_HEADER = True  # Include file-level docstrings/comments
 
 # Embedding Configuration
 EMBEDDING_BATCH_SIZE = 100
 TOP_K_SEEDS = 5
 
 # Cache Configuration
-CACHE_FILE = "pipeline_cache.json"
-GRAPH_FILE = "symbol_graph.json"
+CACHE_DIR = "./pipeline_cache"
+CACHE_FILE = os.path.join(CACHE_DIR, "cache_metadata.json")
+GRAPH_FILE = os.path.join(CACHE_DIR, "symbol_graph.json")
 
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY not found in .env. Please set it.")
@@ -209,6 +212,11 @@ def normalize_route(route: str) -> str:
     route = re.sub(r'/\{[^}]+\}', '/*', route)
     route = re.sub(r'/\*+', '/*', route)
     return route.lower().strip()
+
+def init_cache_dir():
+    """Create cache directory if it doesn't exist."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    print(f"📁 Cache directory: {CACHE_DIR}")
 
 # --- Cleanup ---
 def perform_cleanup():
@@ -346,6 +354,207 @@ async def ingest_sources(github_inputs: str):
     print(f"✅ Total Loaded: {total_files} files across {list(multi_repo_data.keys())}.")
     return multi_repo_data, repo_hashes
 
+class GlobalExtractor:
+    """
+    Extracts global variables, constants, configurations, and defines from files.
+    CRITICAL for understanding code context beyond just function definitions.
+    """
+
+    def extract_globals_from_content(self, content: str, filename: str) -> Dict[str, Any]:
+        """
+        Extract global-level declarations.
+        Returns: {header, imports, constants, globals, config, defines}
+        """
+        ext = os.path.splitext(filename)[1].lower()
+        
+        result = {
+            "header": "",
+            "imports": [],
+            "constants": [],
+            "globals": [],
+            "config": [],
+            "defines": []
+        }
+        
+        lines = content.split('\n')
+        
+        if INCLUDE_FILE_HEADER:
+            result["header"] = self._extract_header(lines, ext)
+        
+        if ext == '.py':
+            result.update(self._extract_python_globals(content, lines))
+        elif ext in ['.js', '.jsx', '.ts', '.tsx']:
+            result.update(self._extract_js_globals(content, lines))
+        elif ext in ['.cpp', '.cc', '.h', '.hpp', '.c', '.ino']:
+            result.update(self._extract_cpp_globals(content, lines))
+        elif ext in ['.java']:
+            result.update(self._extract_java_globals(content, lines))
+        elif ext in ['.go']:
+            result.update(self._extract_go_globals(content, lines))
+        else:
+            result.update(self._extract_generic_globals(content, lines))
+        
+        return result
+
+    def _extract_header(self, lines: List[str], ext: str) -> str:
+        """Extract file-level documentation."""
+        header_lines = []
+        
+        if ext == '.py':
+            if len(lines) > 0 and lines[0].strip().startswith('"""'):
+                for line in lines[:20]:
+                    header_lines.append(line)
+                    if line.strip().endswith('"""') and len(header_lines) > 1:
+                        break
+        
+        elif ext in ['.cpp', '.c', '.h', '.hpp', '.ino', '.js', '.jsx', '.ts', '.tsx']:
+            for line in lines[:30]:
+                stripped = line.strip()
+                if stripped.startswith('//') or stripped.startswith('/*') or stripped.startswith('*'):
+                    header_lines.append(line)
+                elif header_lines and not stripped:
+                    continue
+                else:
+                    break
+        
+        return '\n'.join(header_lines)
+
+    def _extract_python_globals(self, content: str, lines: List[str]) -> Dict:
+        """Extract Python globals."""
+        imports, constants, globals_vars, config = [], [], [], []
+        
+        try:
+            tree = ast.parse(content)
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    imports.append(ast.get_source_segment(content, node))
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            var_name = target.id
+                            var_line = ast.get_source_segment(content, node)
+                            if var_name.isupper():
+                                constants.append(var_line)
+                            elif 'CONFIG' in var_name or 'SETTINGS' in var_name:
+                                config.append(var_line)
+                            else:
+                                globals_vars.append(var_line)
+        except:
+            for line in lines[:EXTRACT_GLOBALS_LINES]:
+                if re.match(r'^import\s+|^from\s+', line.strip()):
+                    imports.append(line)
+                elif re.match(r'^[A-Z_]+\s*=', line.strip()):
+                    constants.append(line)
+                elif re.match(r'^[a-z_]\w*\s*=', line.strip()):
+                    globals_vars.append(line)
+        
+        return {"imports": imports, "constants": constants, "globals": globals_vars, "config": config}
+
+    def _extract_js_globals(self, content: str, lines: List[str]) -> Dict:
+        """Extract JavaScript/TypeScript globals."""
+        imports, constants, globals_vars, config = [], [], [], []
+        
+        for line in lines[:EXTRACT_GLOBALS_LINES]:
+            stripped = line.strip()
+            if stripped.startswith('import ') or stripped.startswith('require('):
+                imports.append(line)
+            elif re.match(r'const\s+[A-Z_]+', stripped):
+                constants.append(line)
+            elif 'config' in stripped.lower() or 'settings' in stripped.lower():
+                config.append(line)
+            elif re.match(r'(let|var|const)\s+\w+', stripped):
+                globals_vars.append(line)
+        
+        return {"imports": imports, "constants": constants, "globals": globals_vars, "config": config}
+
+    def _extract_cpp_globals(self, content: str, lines: List[str]) -> Dict:
+        """Extract C/C++ globals and defines."""
+        imports, constants, globals_vars, defines = [], [], [], []
+        
+        for line in lines[:EXTRACT_GLOBALS_LINES]:
+            stripped = line.strip()
+            if stripped.startswith('#include'):
+                imports.append(line)
+            elif stripped.startswith('#define'):
+                defines.append(line)
+            elif 'const ' in stripped:
+                constants.append(line)
+            elif re.match(r'(extern|static)?\s*(int|float|double|char|bool|void|uint\w*|String)', stripped):
+                if not stripped.endswith(';'):
+                    idx = lines.index(line)
+                    multi = line
+                    for i in range(1, 5):
+                        if idx + i < len(lines):
+                            multi += '\n' + lines[idx + i]
+                            if ';' in lines[idx + i]:
+                                break
+                    globals_vars.append(multi)
+                else:
+                    globals_vars.append(line)
+        
+        return {"imports": imports, "constants": constants, "globals": globals_vars, "defines": defines}
+
+    def _extract_java_globals(self, content: str, lines: List[str]) -> Dict:
+        """Extract Java globals."""
+        imports, constants, globals_vars = [], [], []
+        in_class = False
+        
+        for line in lines[:EXTRACT_GLOBALS_LINES]:
+            stripped = line.strip()
+            if stripped.startswith('import '):
+                imports.append(line)
+            elif 'class ' in stripped:
+                in_class = True
+            elif in_class and 'static final' in stripped:
+                constants.append(line)
+            elif in_class and 'static ' in stripped:
+                globals_vars.append(line)
+        
+        return {"imports": imports, "constants": constants, "globals": globals_vars}
+
+    def _extract_go_globals(self, content: str, lines: List[str]) -> Dict:
+        """Extract Go globals."""
+        imports, constants, globals_vars = [], [], []
+        
+        for line in lines[:EXTRACT_GLOBALS_LINES]:
+            stripped = line.strip()
+            if stripped.startswith('import '):
+                imports.append(line)
+            elif stripped.startswith('const '):
+                constants.append(line)
+            elif stripped.startswith('var '):
+                globals_vars.append(line)
+        
+        return {"imports": imports, "constants": constants, "globals": globals_vars}
+
+    def _extract_generic_globals(self, content: str, lines: List[str]) -> Dict:
+        """Generic extraction."""
+        globals_vars = []
+        for line in lines[:EXTRACT_GLOBALS_LINES]:
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#') and not stripped.startswith('//'):
+                globals_vars.append(line)
+        return {"globals": globals_vars}
+
+    def format_globals_for_context(self, globals_dict: Dict[str, List[str]]) -> str:
+        """Format extracted globals into readable context."""
+        sections = []
+        
+        if globals_dict.get("header"):
+            sections.append(f"# FILE HEADER\n{globals_dict['header']}\n")
+        if globals_dict.get("imports"):
+            sections.append(f"# IMPORTS\n" + "\n".join(globals_dict['imports']) + "\n")
+        if globals_dict.get("defines"):
+            sections.append(f"# DEFINES\n" + "\n".join(globals_dict['defines']) + "\n")
+        if globals_dict.get("constants"):
+            sections.append(f"# CONSTANTS\n" + "\n".join(globals_dict['constants']) + "\n")
+        if globals_dict.get("config"):
+            sections.append(f"# CONFIGURATION\n" + "\n".join(globals_dict['config']) + "\n")
+        if globals_dict.get("globals"):
+            sections.append(f"# GLOBAL VARIABLES\n" + "\n".join(globals_dict['globals']) + "\n")
+        
+        return "\n".join(sections) if sections else ""
+
 # --- 2. Enhanced Tree-Sitter Parser ---
 
 class TreeSitterParser:
@@ -356,6 +565,7 @@ class TreeSitterParser:
     def __init__(self):
         self.parsers = {}
         self.languages = {}
+        self.global_extractor = GlobalExtractor()
         
         if not HAS_TREE_SITTER:
             print("⚠️ Tree-sitter not available, using regex fallback")
@@ -481,20 +691,29 @@ class TreeSitterParser:
             print("   Falling back to regex parsing for all languages")
 
     def parse(self, filename: str, content: str) -> Dict[str, Any]:
-        """Parse file and extract symbols."""
+        """Parse file and extract symbols WITH enhanced global extraction."""
         ext = os.path.splitext(filename)[1].lower()
-        
-        # Try tree-sitter first
+        # FIRST: Extract globals using enhanced extractor
+        globals_data = self.global_extractor.extract_globals_from_content(content, filename)
+        formatted_globals = self.global_extractor.format_globals_for_context(globals_data)
+
+        # THEN: Extract functions using tree-sitter or regex
         parser = self.parsers.get(ext)
         if parser:
             try:
                 tree = parser.parse(bytes(content, "utf8"))
-                return self._extract_symbols(tree.root_node, content, ext)
+                result = self._extract_symbols(tree.root_node, content, ext)
             except Exception as e:
                 print(f"⚠️ Tree-sitter parse error in {filename}: {e}, using regex fallback")
-        
-        # Fallback to regex
-        return self._parse_regex_fallback(content, ext, filename)
+                result = self._parse_regex_fallback(content, ext, filename)
+        else:
+            result = self._parse_regex_fallback(content, ext, filename)
+
+        # COMBINE: Replace simple imports with rich global context
+        result['globals'] = formatted_globals  # This now includes MUCH more!
+        result['globals_data'] = globals_data  # Store structured data too
+
+        return result
 
     def _extract_symbols(self, root_node, content: str, ext: str) -> Dict[str, Any]:
         """Extract functions, classes, and imports from AST."""
@@ -1238,13 +1457,21 @@ class VectorEmbeddingStore:
     def save(self, filepath: str):
         """Save index to disk."""
         if HAS_FAISS and self.index and self.index.ntotal > 0:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
             faiss.write_index(self.index, filepath)
+    
             with open(filepath + '.meta', 'w') as f:
                 json.dump({
                     'node_ids': self.node_ids,
                     'node_metadata': self.node_metadata
                 }, f)
-    
+        else:
+            raise RuntimeError(
+                "Cannot save index: FAISS unavailable or index is empty."
+            )
+
+            
     def load(self, filepath: str):
         """Load index from disk."""
         if HAS_FAISS and os.path.exists(filepath):
@@ -1539,7 +1766,7 @@ def build_context_with_budget(
     """Build context strings with token budgeting."""
     
     files_context = defaultdict(lambda: {"globals": "", "functions": []})
-    
+
     for node_id in selected_nodes:
         if node_id not in active_graph:
             continue
@@ -1553,20 +1780,27 @@ def build_context_with_budget(
         else:
             display_name = node['file']
         
+        # Globals now contain MUCH more info!
         files_context[display_name]["globals"] = node['globals']
         files_context[display_name]["functions"].append(node['code'])
-    
+
     context_blocks = []
-    
+
     for fname, data in files_context.items():
-        block = f"=== FILE: {fname} ===\n"
-        block += f"{data['globals']}\n"
-        block += "\n# ... (other code hidden) ...\n\n"
+        block = f"=== FILE: {fname} ===\n\n"
+        
+        # Show globals PROMINENTLY at the top
+        if data['globals']:
+            block += data['globals']
+            block += "\n" + "="*60 + "\n"
+            block += "# FUNCTION DEFINITIONS BELOW\n"
+            block += "="*60 + "\n\n"
+        
         block += "\n\n".join(data['functions'])
         context_blocks.append(block)
-    
+
     budgeted_context = truncate_to_token_budget(context_blocks, MAX_CONTEXT_TOKENS)
-    
+
     return budgeted_context
 
 # --- Reframer ---
@@ -1664,18 +1898,24 @@ async def answering_agent(user_query: str, context_strings: List[str]) -> str:
 def save_cache(multi_graph: Dict, vector_stores: Dict, repo_hashes: Dict):
     """Save graph and embeddings to cache."""
     print("💾 Saving cache...")
-    
+    # Ensure cache directory exists
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
     cache_data = {
         'timestamp': time.time(),
         'repo_hashes': repo_hashes,
         'graph': multi_graph
     }
-    
+
     with open(CACHE_FILE, 'w') as f:
         json.dump(cache_data, f, indent=2)
-    
+
+    # Save vector indices in cache directory
     for repo_name, store in vector_stores.items():
-        store.save(f"{CACHE_FILE}.{repo_name}.faiss")
+        index_path = os.path.join(CACHE_DIR, f"{repo_name}.faiss")
+        store.save(index_path)
+
+    print(f"   ✅ Cache saved to {CACHE_DIR}")
 
 def load_cache(current_hashes: Dict) -> Optional[Tuple[Dict, Dict]]:
     """Load cache if valid."""
@@ -1696,16 +1936,17 @@ def load_cache(current_hashes: Dict) -> Optional[Tuple[Dict, Dict]]:
         
         multi_graph = cache_data['graph']
         
+        # Load vector stores from cache directory
         vector_stores = {}
         for repo_name in multi_graph.keys():
             store = VectorEmbeddingStore()
-            index_path = f"{CACHE_FILE}.{repo_name}.faiss"
+            index_path = os.path.join(CACHE_DIR, f"{repo_name}.faiss")
             if os.path.exists(index_path):
                 store.load(index_path)
                 vector_stores[repo_name] = store
         
         return multi_graph, vector_stores
-        
+    
     except Exception as e:
         print(f"⚠️ Cache load error: {e}")
         return None
@@ -1714,7 +1955,8 @@ def load_cache(current_hashes: Dict) -> Optional[Tuple[Dict, Dict]]:
 
 async def main():
     chat_history = []
-    
+    init_cache_dir()
+
     try:
         print("🔗 === GITHUB SOURCE CONFIGURATION === 🔗")
         gh_input = input("\n🐙 Enter GitHub Repos (comma-separated): ")
